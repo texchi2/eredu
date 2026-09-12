@@ -78,6 +78,19 @@ pub struct FamilyConfig {
     pub audio_token_id: Option<i32>,
 }
 
+/// Whether a nested media configuration is the stub left by a text-only
+/// conversion: an object without the encoder geometry (`num_hidden_layers`)
+/// that every real Gemma 4 vision or audio tower declares. Such checkpoints
+/// (for example the `mlx-community` text-only 4-bit conversions) ship the
+/// `vision_config` / `audio_config` keys with only projector metadata, so the
+/// tower is treated as absent instead of failing the whole text model.
+fn is_media_config_stub(value: &serde_json::Value) -> bool {
+    match value.as_object() {
+        Some(object) => !object.contains_key("num_hidden_layers"),
+        None => true,
+    }
+}
+
 impl FamilyConfig {
     /// Returns the nested text implementation identity preserved at admission.
     pub fn effective_model_type(&self) -> &str {
@@ -123,8 +136,11 @@ impl FamilyConfig {
             );
         }
         let text = ModelArgs::from_hf_json(&serde_json::to_vec(&text_value)?)?;
+        let vision_stub = source.vision_config.as_ref().is_some_and(is_media_config_stub);
+        let audio_stub = source.audio_config.as_ref().is_some_and(is_media_config_stub);
         let vision = source
             .vision_config
+            .filter(|_| !vision_stub)
             .map(|value| -> Result<VisionConfig, FamilyConfigError> {
                 let config: VisionConfig = serde_json::from_value(value)?;
                 config.validate()?;
@@ -133,20 +149,36 @@ impl FamilyConfig {
             .transpose()?;
         let audio = source
             .audio_config
+            .filter(|_| !audio_stub)
             .map(|value| -> Result<AudioConfig, FamilyConfigError> {
                 let config: AudioConfig = serde_json::from_value(value)?;
                 config.validate()?;
                 Ok(config)
             })
             .transpose()?;
+        // A text-only conversion keeps the placeholder ids of the towers it
+        // reduced to stubs; without an encoder they admit nothing, so they are
+        // cleared rather than reported as a modality the artifact cannot serve.
+        // A placeholder with no media configuration at all is still an orphan
+        // and is rejected by `validate`.
+        let (image_token_id, video_token_id) = if vision_stub {
+            (None, None)
+        } else {
+            (source.image_token_id, source.video_token_id)
+        };
+        let audio_token_id = if audio_stub {
+            None
+        } else {
+            source.audio_token_id
+        };
         let config = Self {
             model_type: source.model_type,
             text,
             vision,
-            image_token_id: source.image_token_id,
-            video_token_id: source.video_token_id,
+            image_token_id,
+            video_token_id,
             audio,
-            audio_token_id: source.audio_token_id,
+            audio_token_id,
         };
         config.validate()?;
         Ok(config)
@@ -281,6 +313,32 @@ impl FamilyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_only_conversion_stub_media_configs_are_treated_as_absent() {
+        // mlx-community's text-only 4-bit conversions keep `vision_config` /
+        // `audio_config` with projector metadata only (no `num_hidden_layers`)
+        // and the placeholder ids of the towers they dropped.
+        let mut value = config();
+        let object = value.as_object_mut().unwrap();
+        object.insert(
+            "vision_config".into(),
+            serde_json::json!({"model_type":"gemma4_vision","mm_embed_dim":16,"rms_norm_eps":0.000001}),
+        );
+        object.insert(
+            "audio_config".into(),
+            serde_json::json!({"model_type":"gemma4_audio","hidden_size":16,"output_proj_dims":8,"rms_norm_eps":0.000001}),
+        );
+        let family = FamilyConfig::from_hf_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(family.vision.is_none());
+        assert!(family.audio.is_none());
+        assert_eq!(family.image_token_id, None);
+        assert_eq!(family.video_token_id, None);
+        assert_eq!(family.audio_token_id, None);
+        assert!(!family.input_modalities().image);
+        assert!(!family.input_modalities().audio);
+        assert!(!is_media_config_stub(&config()["vision_config"]));
+    }
 
     fn config() -> serde_json::Value {
         serde_json::json!({
