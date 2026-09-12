@@ -430,14 +430,12 @@ pub fn assistant_safetensors_plan(
     let canonical_names = common
         .iter()
         .filter_map(|tensor| {
-            tensor
-                .aliases
-                .first()
+            super::checkpoint::neutral_alias(tensor)
                 .map(|canonical| (tensor.key.clone(), canonical.clone()))
         })
         .collect::<std::collections::BTreeMap<_, _>>();
     for tensor in &mut common {
-        if let Some(canonical) = tensor.aliases.first().cloned() {
+        if let Some(canonical) = super::checkpoint::neutral_alias(tensor).cloned() {
             tensor.key = canonical;
         }
         if let Some(companion) = &mut tensor.linear_companion {

@@ -84,7 +84,7 @@ pub struct FamilyConfig {
 /// (for example the `mlx-community` text-only 4-bit conversions) ship the
 /// `vision_config` / `audio_config` keys with only projector metadata, so the
 /// tower is treated as absent instead of failing the whole text model.
-fn is_media_config_stub(value: &serde_json::Value) -> bool {
+pub(crate) fn is_media_config_stub(value: &serde_json::Value) -> bool {
     match value.as_object() {
         Some(object) => !object.contains_key("num_hidden_layers"),
         None => true,
@@ -136,8 +136,14 @@ impl FamilyConfig {
             );
         }
         let text = ModelArgs::from_hf_json(&serde_json::to_vec(&text_value)?)?;
-        let vision_stub = source.vision_config.as_ref().is_some_and(is_media_config_stub);
-        let audio_stub = source.audio_config.as_ref().is_some_and(is_media_config_stub);
+        let vision_stub = source
+            .vision_config
+            .as_ref()
+            .is_some_and(is_media_config_stub);
+        let audio_stub = source
+            .audio_config
+            .as_ref()
+            .is_some_and(is_media_config_stub);
         let vision = source
             .vision_config
             .filter(|_| !vision_stub)

@@ -281,10 +281,10 @@ pub fn safetensors_plan(family: &FamilyConfig) -> Result<SafetensorsCheckpointPl
         add_safetensors_layer(args, layer, hidden, &mut common, &mut groups)?;
     }
     if let Some(vision) = &family.vision {
-        add_safetensors_vision(vision, hidden, &mut common)?;
+        add_safetensors_vision(args, vision, hidden, &mut common)?;
     }
     if let Some(audio) = &family.audio {
-        add_safetensors_audio(audio, hidden, &mut common)?;
+        add_safetensors_audio(args, audio, hidden, &mut common)?;
     }
     for constraint in &mut common {
         add_mlx_vlm_aliases(constraint);
@@ -339,6 +339,26 @@ fn mlx_vlm_physical_name(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether a name uses the `mlx-vlm` physical spelling rather than the
+/// released or backend-neutral one.
+pub(crate) fn is_mlx_vlm_physical_name(name: &str) -> bool {
+    name.starts_with("language_model.")
+        || name.starts_with("vision_tower.")
+        || name.starts_with("embed_vision.")
+        || name.starts_with("audio_tower.")
+        || name.starts_with("embed_audio.")
+}
+
+/// The backend-neutral alias of a constraint, if it has one. Alias order is
+/// normalized alphabetically by the checkpoint plan, so callers that need the
+/// neutral name must select it rather than take the first alias.
+pub(crate) fn neutral_alias(tensor: &SafetensorsTensorConstraint) -> Option<&String> {
+    tensor
+        .aliases
+        .iter()
+        .find(|alias| !is_mlx_vlm_physical_name(alias))
 }
 
 /// Adds the `mlx-vlm` physical alias of a constraint's key and existing
@@ -633,6 +653,7 @@ fn add_text_matrix(
 }
 
 fn add_safetensors_vision(
+    args: &ModelArgs,
     config: &super::VisionConfig,
     text_hidden: usize,
     output: &mut Vec<SafetensorsTensorConstraint>,
@@ -701,13 +722,33 @@ fn add_safetensors_vision(
             output.push(safe(format!("{root}.{local}"), vec![head]));
         }
     }
+    // The media-to-text projection is stored alongside the decoder: a
+    // quantized decoder conversion quantizes it with the text weights, so its
+    // format follows the text configuration, not the tower's.
     let projection = "model.embed_vision.embedding_projection.weight";
     add_matrix(
         output,
         projection,
         vec![text_hidden, hidden],
-        config.linear_format_for(projection, hidden as i32),
+        media_projection_format(
+            args,
+            config.linear_format_for(projection, hidden as i32),
+            projection,
+        ),
     )
+}
+
+/// Format of a media-to-text projection: the decoder's declared format when
+/// it names a quantized encoding, otherwise the tower's.
+fn media_projection_format(
+    args: &ModelArgs,
+    tower: eredu_checkpoint::LinearFormat,
+    name: &str,
+) -> eredu_checkpoint::LinearFormat {
+    match args.linear_format_for(name) {
+        eredu_checkpoint::LinearFormat::Dense => tower,
+        decoder => decoder,
+    }
 }
 
 fn add_clipped_matrix(
@@ -731,6 +772,7 @@ fn add_clipped_matrix(
 }
 
 fn add_safetensors_audio(
+    args: &ModelArgs,
     config: &super::AudioConfig,
     text_hidden: usize,
     output: &mut Vec<SafetensorsTensorConstraint>,
@@ -849,7 +891,11 @@ fn add_safetensors_audio(
         output,
         media_projection,
         vec![text_hidden, projection],
-        config.linear_format_for(media_projection, projection as i32),
+        media_projection_format(
+            args,
+            config.linear_format_for(media_projection, projection as i32),
+            media_projection,
+        ),
     )
 }
 
@@ -1680,25 +1726,46 @@ mod tests {
                 .as_deref(),
             Some("audio_tower.layers.0.lconv1d.linear_end.input_max")
         );
-        assert_eq!(mlx_vlm_physical_name("model.layers.0.mlp.down_proj.weight"), None);
-        assert_eq!(mlx_vlm_physical_name("masked_embedding.centroids.weight"), None);
+        assert_eq!(
+            mlx_vlm_physical_name("model.layers.0.mlp.down_proj.weight"),
+            None
+        );
+        assert_eq!(
+            mlx_vlm_physical_name("masked_embedding.centroids.weight"),
+            None
+        );
         let family = sparse_family();
         let safe = safetensors_plan(&family).unwrap();
         let mut seen_text = false;
         let mut seen_media = false;
-        for tensor in safe.common_tensors.iter().chain(
-            safe.layout_groups
-                .iter()
-                .flat_map(|group| group.variants.iter().flat_map(|variant| variant.tensors.iter())),
-        ) {
+        for tensor in safe
+            .common_tensors
+            .iter()
+            .chain(safe.layout_groups.iter().flat_map(|group| {
+                group
+                    .variants
+                    .iter()
+                    .flat_map(|variant| variant.tensors.iter())
+            }))
+        {
             if tensor.key.starts_with("model.language_model.") {
                 let physical = mlx_vlm_physical_name(&tensor.key).unwrap();
-                assert!(tensor.aliases.contains(&physical), "{} lacks {physical}", tensor.key);
+                assert!(
+                    tensor.aliases.contains(&physical),
+                    "{} lacks {physical}",
+                    tensor.key
+                );
                 seen_text = true;
             }
-            if tensor.key.starts_with("model.vision_tower.") || tensor.key.starts_with("model.audio_tower.") {
+            if tensor.key.starts_with("model.vision_tower.")
+                || tensor.key.starts_with("model.audio_tower.")
+            {
                 let physical = mlx_vlm_physical_name(&tensor.key).unwrap();
-                assert!(tensor.aliases.contains(&physical), "{} lacks {physical}", tensor.key);
+                assert!(
+                    tensor.aliases.contains(&physical),
+                    "{} lacks {physical}",
+                    tensor.key
+                );
                 seen_media = true;
             }
         }
