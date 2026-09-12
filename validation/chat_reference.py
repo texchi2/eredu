@@ -19,6 +19,9 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="float32")
     parser.add_argument("--threads", type=int, default=16)
+    parser.add_argument(
+        "--trust-remote-code", action="store_true",
+        help="Execute model code shipped in the checkpoint directory (off by default)")
     args = parser.parse_args()
     import torch
     import transformers
@@ -37,7 +40,7 @@ def main():
     input_ids = tokenizer.encode(prompt, add_special_tokens=False)
     assert input_ids == report["prompt_ids"], "publisher/Eredu prompt token IDs differ"
     model = transformers.AutoModelForCausalLM.from_pretrained(
-        path, trust_remote_code=True, local_files_only=True,
+        path, trust_remote_code=args.trust_remote_code, local_files_only=True,
         torch_dtype=getattr(torch, args.dtype), attn_implementation="eager",
     ).to(args.device).eval()
     close = tokenizer.convert_tokens_to_ids("</think>")

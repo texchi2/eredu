@@ -20,12 +20,20 @@ def main():
     parser.add_argument('publisher', type=Path)
     parser.add_argument('artifact', type=Path)
     parser.add_argument('output', type=Path)
+    parser.add_argument(
+        '--trust-remote-code', action='store_true',
+        help='Execute the publisher directory\'s model code. Required: this reference '
+             'instantiates the publisher class through get_class_from_dynamic_module.')
     args = parser.parse_args()
+    if not args.trust_remote_code:
+        parser.error(
+            'this reference executes the model code in PINNED_PUBLISHER_DIRECTORY; '
+            'pass --trust-remote-code once the directory has been verified')
     torch.set_num_threads(1)
     config_data = json.loads((args.artifact / 'config.json').read_text())
     config_data.pop('quantization_config')
     prototype = transformers.AutoConfig.from_pretrained(
-        args.publisher, trust_remote_code=True, local_files_only=True)
+        args.publisher, trust_remote_code=args.trust_remote_code, local_files_only=True)
     config = type(prototype)(**config_data)
     config._attn_implementation = 'eager'
     model_class = get_class_from_dynamic_module(

@@ -29,19 +29,23 @@ def main():
     parser.add_argument("--decode-steps", type=int, default=4)
     parser.add_argument("--stop-at-eos", action="store_true")
     parser.add_argument("--greedy", action="store_true", help="Feed the previous argmax into each cached step")
+    parser.add_argument(
+        "--trust-remote-code", action="store_true",
+        help="Execute model code shipped in the artifact directory (off by default)")
     args = parser.parse_args()
     if args.decode_steps < 0:
         parser.error("--decode-steps must be nonnegative")
     torch.set_num_threads(args.threads)
     model = transformers.AutoModelForCausalLM.from_pretrained(
-        args.artifact, trust_remote_code=True, local_files_only=True,
+        args.artifact, trust_remote_code=args.trust_remote_code, local_files_only=True,
         dtype=getattr(torch, args.dtype), attn_implementation="eager",
     ).eval().to(args.device)
     tokenizer = None
     rendered_prompt = None
     prefix = [1, 3, 2]
     if args.prompt is not None or args.chat_request is not None:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(args.artifact, trust_remote_code=True, local_files_only=True)
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            args.artifact, trust_remote_code=args.trust_remote_code, local_files_only=True)
         if args.chat_request is not None:
             request = json.loads(args.chat_request.read_text())
             rendered_prompt = tokenizer.apply_chat_template(
