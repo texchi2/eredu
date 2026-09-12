@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 
-use eredu_checkpoint::WeightQuantization;
 use eredu_core::InputModalities;
 use serde::Deserialize;
 
@@ -48,7 +47,7 @@ struct FamilySource {
     #[serde(default = "default_true")]
     tie_word_embeddings: bool,
     #[serde(default)]
-    quantization: Option<WeightQuantization>,
+    quantization: Option<serde_json::Value>,
 }
 
 fn default_model_type() -> String {
@@ -91,6 +90,56 @@ pub(crate) fn is_media_config_stub(value: &serde_json::Value) -> bool {
     }
 }
 
+/// Splits a Hugging Face `quantization` object into the default weight
+/// format and the per-tensor overrides that mixed-precision conversions carry
+/// as nested objects keyed by physical tensor name without the `.weight`
+/// suffix (for example `language_model.model.layers.3.mlp.down_proj`). Each
+/// override inherits the fields it omits (typically `mode`) from the default
+/// and is re-keyed by the canonical `model.*.weight` name the checkpoint plan
+/// resolves formats with.
+fn split_quantization(
+    value: serde_json::Value,
+) -> Result<
+    (
+        serde_json::Value,
+        serde_json::Map<String, serde_json::Value>,
+    ),
+    FamilyConfigError,
+> {
+    let serde_json::Value::Object(entries) = value else {
+        return Ok((value, serde_json::Map::new()));
+    };
+    let mut default = serde_json::Map::new();
+    let mut nested = Vec::new();
+    for (key, entry) in entries {
+        match entry {
+            serde_json::Value::Object(_) => nested.push((key, entry)),
+            serde_json::Value::Bool(false) => {
+                return Err(FamilyConfigError::Invalid(format!(
+                    "Gemma 4 quantization marks {key:?} as unquantized; per-tensor dense overrides are not supported"
+                )))
+            }
+            serde_json::Value::Bool(true) => {}
+            other => {
+                default.insert(key, other);
+            }
+        }
+    }
+    let mut overrides = serde_json::Map::new();
+    for (key, entry) in nested {
+        let serde_json::Value::Object(fields) = entry else {
+            unreachable!("only objects are collected");
+        };
+        let mut merged = default.clone();
+        merged.extend(fields);
+        overrides.insert(
+            crate::gemma4::config::canonical_weight_name(&key),
+            serde_json::Value::Object(merged),
+        );
+    }
+    Ok((serde_json::Value::Object(default), overrides))
+}
+
 impl FamilyConfig {
     /// Returns the nested text implementation identity preserved at admission.
     pub fn effective_model_type(&self) -> &str {
@@ -130,10 +179,14 @@ impl FamilyConfig {
             serde_json::Value::Bool(source.tie_word_embeddings),
         );
         if let Some(quantization) = source.quantization {
-            text_object.insert(
-                "weight_quantization".into(),
-                serde_json::to_value(quantization)?,
-            );
+            let (default, overrides) = split_quantization(quantization)?;
+            text_object.insert("weight_quantization".into(), default);
+            if !overrides.is_empty() {
+                text_object.insert(
+                    "quantized_weight_configs".into(),
+                    serde_json::Value::Object(overrides),
+                );
+            }
         }
         let text = ModelArgs::from_hf_json(&serde_json::to_vec(&text_value)?)?;
         let vision_stub = source
@@ -319,6 +372,48 @@ impl FamilyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_tensor_quantization_overrides_reach_the_text_formats() {
+        let mut value = config();
+        value["quantization"] = serde_json::json!({
+            "group_size": 64, "bits": 4, "mode": "affine",
+            "language_model.model.layers.0.mlp.down_proj": {"bits": 8, "group_size": 64},
+            "model.language_model.layers.1.mlp.up_proj": {"bits": 8, "group_size": 32},
+            "language_model.model.embed_tokens": {"bits": 6, "group_size": 64}
+        });
+        let family = FamilyConfig::from_hf_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+        let bits = |name: &str| {
+            family
+                .text
+                .linear_format_for(name)
+                .weight_quantization()
+                .expect("quantized")
+                .bits()
+        };
+        assert_eq!(bits("model.layers.0.mlp.down_proj.weight"), 8);
+        assert_eq!(bits("model.layers.1.mlp.up_proj.weight"), 8);
+        assert_eq!(bits("model.embed_tokens.weight"), 6);
+        assert_eq!(bits("model.layers.0.mlp.up_proj.weight"), 4);
+        assert_eq!(bits("model.layers.0.self_attn.q_proj.weight"), 4);
+        assert_eq!(
+            crate::gemma4::config::canonical_weight_name("language_model.lm_head"),
+            "lm_head.weight"
+        );
+        assert_eq!(
+            crate::gemma4::config::canonical_weight_name(
+                "vision_tower.encoder.layers.0.mlp.down_proj.linear"
+            ),
+            "model.vision_tower.encoder.layers.0.mlp.down_proj.linear.weight"
+        );
+
+        let mut value = config();
+        value["quantization"] = serde_json::json!({
+            "group_size": 64, "bits": 4,
+            "language_model.model.layers.0.mlp.down_proj": false
+        });
+        assert!(FamilyConfig::from_hf_json(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
 
     #[test]
     fn text_only_conversion_stub_media_configs_are_treated_as_absent() {
