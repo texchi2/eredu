@@ -5,7 +5,7 @@ use eredu_core::cache::{
     StateTensorPolicy, StateTensorRole,
 };
 use eredu_core::LayerSchedule;
-use eredu_nn::{AttentionStateSource, AttentionValueSource};
+use eredu_nn::AttentionStateSource;
 use eredu_runtime::{
     ComponentDomain, ComponentGraph, ComponentGraphError, ComponentKind, ComponentResidencyClass,
     ComponentSpec, StateError, StateLayout,
@@ -152,30 +152,19 @@ pub fn state_layout(args: &ModelArgs) -> Result<StateLayout, StateError> {
             let kv_heads = policy.num_key_value_heads.get() as i32;
             let head_dim = policy.head_dim.get() as i32;
             let fixed = (layer == 0).then(|| vec![prefix.clone()]);
-            match (policy.key_value.value(), fixed) {
-                (Some(AttentionValueSource::ReuseKey), Some(fixed)) => {
-                    LayerCachePolicy::key_only_with_fixed_state(
-                        policy.attention,
-                        kv_heads,
-                        head_dim,
-                        fixed,
-                    )
-                }
-                (Some(AttentionValueSource::ReuseKey), None) => {
-                    LayerCachePolicy::key_only(policy.attention, kv_heads, head_dim)
-                }
-                (Some(AttentionValueSource::Projected), Some(fixed)) => {
-                    LayerCachePolicy::key_value_with_fixed_state(
-                        policy.attention,
-                        kv_heads,
-                        head_dim,
-                        fixed,
-                    )
-                }
-                (Some(AttentionValueSource::Projected), None) => {
-                    LayerCachePolicy::key_value(policy.attention, kv_heads, head_dim)
-                }
-                (None, _) => unreachable!("shared state returned above"),
+            // Gemma 4's `attention_k_eq_v` reuses the key PROJECTION, not the
+            // cached key tensor: the value branch takes an unscaled RMS norm
+            // and is never rotated, while the cached keys carry `k_norm` and
+            // RoPE. A key-only cache would therefore hand rotated keys back as
+            // values, so both tensors are stored for every state-owning layer.
+            match fixed {
+                Some(fixed) => LayerCachePolicy::key_value_with_fixed_state(
+                    policy.attention,
+                    kv_heads,
+                    head_dim,
+                    fixed,
+                ),
+                None => LayerCachePolicy::key_value(policy.attention, kv_heads, head_dim),
             }
             .map_err(|error| StateError::InvalidResidency(error.to_string()))
         })
@@ -223,15 +212,17 @@ mod tests {
     }
 
     #[test]
-    fn state_layout_uses_key_only_and_shared_slots_from_layer_policy() {
+    fn state_layout_stores_values_even_for_reused_key_projections() {
         let layout = state_layout(&args()).unwrap();
         assert!(matches!(
             layout.layer(0),
             Some(LayerCachePolicy::KeyValueWithFixedState { .. })
         ));
+        // Layer 1 declares `attention_k_eq_v`; its values are a separately
+        // normalized, unrotated tensor, so the cache must retain them.
         assert!(matches!(
             layout.layer(1),
-            Some(LayerCachePolicy::KeyOnly { .. })
+            Some(LayerCachePolicy::KeyValue { .. })
         ));
         assert!(matches!(layout.layer(3), Some(LayerCachePolicy::NoState)));
     }
